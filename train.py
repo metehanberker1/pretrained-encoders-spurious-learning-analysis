@@ -5,189 +5,229 @@ from transformers import (
     AutoModelForSequenceClassification,
     TrainingArguments,
     Trainer,
+    EvalPrediction
 )
 from datasets import load_dataset
 import numpy as np
 from typing import Dict, List, Tuple
 import logging
 import os
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Model configurations
-BERT_MODELS = [
-    "lyeonii/bert-tiny",
-    "lyeonii/bert-small",
-    "lyeonii/bert-medium",
-    "google-bert/bert-base-uncased",
-    "google-bert/bert-large-uncased"
-]
-
-ROBERTA_MODELS = [
-    "smallbenchnlp/roberta-small",
-    "JackBAI/roberta-medium",
-    "FacebookAI/roberta-base",
-    "FacebookAI/roberta-large"
-]
+# Enable CUDA optimizations
+torch.backends.cudnn.benchmark = True
 
 class ToxicSpansAnalyzer:
     def __init__(self, model_name: str, dataset_name: str = 'heegyu/toxic-spans'):
         """
         Initialize the ToxicSpansAnalyzer with a specific model and dataset.
-        
-        Args:
-            model_name: Name of the pretrained model to use
-            dataset_name: Name of the dataset to use for fine-tuning
         """
         self.model_name = model_name
         self.dataset_name = dataset_name
         self.dataset = load_dataset(dataset_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        # Initialize tokenizer with optimized settings
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            use_fast=True,
+            model_max_length=256
+        )
+        
         self.model = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Using device: {self.device}")
         
+    def compute_metrics(self, eval_pred: EvalPrediction) -> Dict:
+        """
+        Compute evaluation metrics for the model.
+        
+        Args:
+            eval_pred: Evaluation prediction object containing predictions and labels
+            
+        Returns:
+            Dictionary containing various metrics
+        """
+        predictions, labels = eval_pred
+        predictions = np.argmax(predictions, axis=1)
+        
+        # Calculate metrics
+        precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='binary')
+        accuracy = accuracy_score(labels, predictions)
+        
+        return {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1
+        }
+
     def preprocess_dataset(self) -> Dict:
         """
         Preprocess the dataset for training.
-        
-        Returns:
-            Preprocessed dataset dictionary
         """
         def preprocess_function(examples):
             return self.tokenizer(
                 examples["text_of_post"],
                 truncation=True,
                 padding="max_length",
-                max_length=128,
-                return_attention_mask=True
+                max_length=256,
+                return_attention_mask=True,
+                return_tensors=None
             )
         
         def preprocess_labels(examples):
             examples["labels"] = examples["toxic"]
             return examples
         
-        # Process the dataset
-        tokenized_datasets = self.dataset.map(preprocess_function, batched=True)
-        tokenized_datasets = tokenized_datasets.map(preprocess_labels)
+        logger.info("Starting dataset preprocessing...")
         
-        # Remove unnecessary columns
+        tokenized_datasets = self.dataset.map(
+            preprocess_function,
+            batched=True,
+            batch_size=1000,
+            num_proc=4
+        )
+        
+        tokenized_datasets = tokenized_datasets.map(
+            preprocess_labels,
+            batched=True,
+            num_proc=4
+        )
+        
         columns_to_remove = [
             "text_of_post", "toxic", "probability", "position",
             "type", "support", "position_probability"
         ]
         tokenized_datasets = tokenized_datasets.remove_columns(columns_to_remove)
         
+        tokenized_datasets.set_format("torch")
+        
+        logger.info("Dataset preprocessing completed")
         return tokenized_datasets
 
-    def fine_tune(self, output_dir: str):
+    def save_model(self, output_dir: str):
         """
-        Fine-tune the model on the toxic spans dataset.
+        Save the model and tokenizer properly.
         
         Args:
-            output_dir: Directory to save the model and results
+            output_dir: Directory to save the model
+        """
+        logger.info(f"Saving model to {output_dir}")
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save the model with all components
+        self.model.save_pretrained(
+            output_dir,
+            save_config=True,
+            safe_serialization=True  # Use safe serialization for better compatibility
+        )
+        
+        # Save the tokenizer
+        self.tokenizer.save_pretrained(output_dir)
+        
+        logger.info("Model and tokenizer saved successfully")
+
+    def push_to_hub(self, repo_name: str):
+        """
+        Push the model and tokenizer to the Hugging Face Hub.
+        
+        Args:
+            repo_name: Name of the repository on the Hub
+        """
+        logger.info(f"Pushing model to Hub as {repo_name}")
+        
+        try:
+            # Push both model and tokenizer
+            self.model.push_to_hub(repo_name)
+            self.tokenizer.push_to_hub(repo_name)
+            logger.info("Successfully pushed model and tokenizer to Hub")
+        except Exception as e:
+            logger.error(f"Error pushing to Hub: {str(e)}")
+            raise
+
+    def fine_tune(self, output_dir: str, repo_name: str = None):
+        """
+        Fine-tune the model and save results.
+        
+        Args:
+            output_dir: Directory to save the model
+            repo_name: Optional name for the Hub repository
         """
         tokenized_datasets = self.preprocess_dataset()
         
-        # Initialize model for sequence classification
+        # Initialize model
         self.model = AutoModelForSequenceClassification.from_pretrained(
             self.model_name,
-            num_labels=2,  # Binary classification
+            num_labels=2,
+            torchscript=True
         ).to(self.device)
         
-        # Define training arguments
+        # Calculate optimal batch size
+        optimal_batch_size = 32
+        if torch.cuda.is_available():
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            optimal_batch_size = int(min(32 * (gpu_memory / 8), 128))
+        
         training_args = TrainingArguments(
             output_dir=output_dir,
             evaluation_strategy="epoch",
             save_strategy="epoch",
             learning_rate=2e-5,
-            per_device_train_batch_size=16,
-            per_device_eval_batch_size=64,
+            per_device_train_batch_size=optimal_batch_size,
+            per_device_eval_batch_size=optimal_batch_size * 2,
             num_train_epochs=3,
             weight_decay=0.01,
             logging_dir=f"{output_dir}/logs",
             logging_steps=10,
             save_total_limit=2,
             fp16=torch.cuda.is_available(),
-            push_to_hub=True,
-            hub_model_id=f"toxic-spans-{self.model_name.split('/')[-1]}"
+            gradient_checkpointing=True,
+            dataloader_num_workers=4,
+            dataloader_pin_memory=True,
+            # Disable automatic Hub pushing (we'll do it manually)
+            push_to_hub=False
         )
         
-        # Initialize trainer
         trainer = Trainer(
             model=self.model,
             args=training_args,
             train_dataset=tokenized_datasets["train"],
             eval_dataset=tokenized_datasets["test"],
             tokenizer=self.tokenizer,
+            compute_metrics=self.compute_metrics
         )
         
-        # Train and push to hub
-        trainer.train()
-        trainer.push_to_hub()
+        # Train the model
+        logger.info("Starting training...")
+        train_result = trainer.train()
         
-        return trainer
-
-    def calculate_token_importance(self, text: str) -> Tuple[List[float], List[str]]:
-        """
-        Calculate importance scores for each token in the text.
+        # Evaluate the model
+        logger.info("Evaluating model...")
+        eval_results = trainer.evaluate()
         
-        Args:
-            text: Input text to analyze
-            
-        Returns:
-            Tuple of (importance_scores, tokens)
-        """
-        # Tokenize input
-        tokens = self.tokenizer.tokenize(text)
-        inputs = self.tokenizer(text, return_tensors="pt", padding=True).to(self.device)
+        # Log evaluation results
+        logger.info("Evaluation Results:")
+        for key, value in eval_results.items():
+            logger.info(f"{key}: {value}")
         
-        # Get model outputs with gradient computation
-        self.model.eval()
-        inputs['input_ids'].requires_grad_()
-        outputs = self.model(**inputs)
+        # Save the model properly
+        self.save_model(output_dir)
         
-        # Calculate gradients with respect to toxic class
-        toxic_class_score = outputs.logits[0, 1]  # Get score for toxic class
-        toxic_class_score.backward()
+        # Push to hub if repo_name is provided
+        if repo_name:
+            self.push_to_hub(repo_name)
         
-        # Get gradients and token importances
-        input_grads = inputs['input_ids'].grad[0].abs()
-        importance_scores = input_grads.cpu().numpy()
-        
-        return importance_scores, tokens
-
-    def compute_metrics(self, text: str) -> Dict[str, float]:
-        """
-        Compute metrics for token importance analysis.
-        
-        Args:
-            text: Input text to analyze
-            
-        Returns:
-            Dictionary of computed metrics
-        """
-        importance_scores, tokens = self.calculate_token_importance(text)
-        
-        # Calculate various metrics
-        metrics = {
-            'mean_importance': float(np.mean(importance_scores)),
-            'max_importance': float(np.max(importance_scores)),
-            'importance_std': float(np.std(importance_scores)),
-            'top_10_percent_ratio': float(np.mean(importance_scores >= np.percentile(importance_scores, 90))),
-        }
-        
-        return metrics
+        return train_result, eval_results
 
 def run_experiment(models: List[str], test_texts: List[str], base_output_dir: str = "./results"):
     """
-    Run the full experiment across multiple models.
-    
-    Args:
-        models: List of model names to evaluate
-        test_texts: List of texts to use for evaluation
-        base_output_dir: Base directory for saving results
+    Run experiments across multiple models.
     """
     results = {}
     
@@ -195,31 +235,27 @@ def run_experiment(models: List[str], test_texts: List[str], base_output_dir: st
         logger.info(f"Processing model: {model_name}")
         
         try:
-            # Initialize analyzer
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             analyzer = ToxicSpansAnalyzer(model_name)
-            
-            # Fine-tune model
             output_dir = os.path.join(base_output_dir, model_name.replace('/', '_'))
-            analyzer.fine_tune(output_dir)
+            repo_name = f"toxic-spans-{model_name.split('/')[-1]}"
             
-            # Evaluate on test texts
-            model_results = {}
-            for text in test_texts:
-                metrics = analyzer.compute_metrics(text)
-                for metric_name, value in metrics.items():
-                    if metric_name not in model_results:
-                        model_results[metric_name] = []
-                    model_results[metric_name].append(value)
+            train_results, eval_results = analyzer.fine_tune(output_dir, repo_name)
             
-            # Average metrics across texts
             results[model_name] = {
-                metric: float(np.mean(values))
-                for metric, values in model_results.items()
+                "train_results": train_results,
+                "eval_results": eval_results
             }
             
         except Exception as e:
             logger.error(f"Error processing model {model_name}: {str(e)}")
             results[model_name] = {"error": str(e)}
+        
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     
     return results
 
@@ -231,8 +267,31 @@ if __name__ == "__main__":
         "Another example with potentially toxic elements."
     ]
     
-    # Run experiments for both BERT and RoBERTa models
+    # Set torch multiprocessing method
+    torch.multiprocessing.set_start_method('spawn', force=True)
+    
+    # Define model lists
+    BERT_MODELS = [
+        "lyeonii/bert-tiny",
+        "lyeonii/bert-small",
+        "lyeonii/bert-medium",
+        "google-bert/bert-base-uncased",
+        "google-bert/bert-large-uncased"
+    ]
+    
+    ROBERTA_MODELS = [
+        "smallbenchnlp/roberta-small",
+        "JackBAI/roberta-medium",
+        "FacebookAI/roberta-base",
+        "FacebookAI/roberta-large"
+    ]
+    
+    # Run experiments
+    logger.info("Starting BERT experiments...")
     bert_results = run_experiment(BERT_MODELS, test_texts)
+    
+    logger.info("Starting RoBERTa experiments...")
     roberta_results = run_experiment(ROBERTA_MODELS, test_texts)
     
-    # Print results
+    # Print final results
+    logger.info("Experiment completed")
